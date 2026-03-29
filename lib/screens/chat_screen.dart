@@ -54,7 +54,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollToBottom();
 
     try {
-      final response = await _chatService.sendMessage(text);
+      final response = await _chatService.sendMessage(text, audioUrl: audioUrl);
       if (!mounted) return;
       setState(() {
         _isTyping = false;

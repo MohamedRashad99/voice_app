@@ -1,10 +1,8 @@
-import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
+import 'package:dio/dio.dart';
 import '../models/message.dart';
 
-/// ChatService provides the chat logic.
-/// In production, replace _generateResponse with an actual API call
-/// (e.g., OpenAI, Anthropic Claude, etc.).
 class ChatService {
   static final ChatService _instance = ChatService._internal();
   factory ChatService() => _instance;
@@ -18,81 +16,124 @@ class ChatService {
     'Hey! Ready to help. What can I do for you?',
   ];
 
-  static const Map<String, String> _responses = {
-    'hello': 'Hello! Great to meet you. How can I help you today?',
-    'hi': 'Hi there! What can I assist you with?',
-    'how are you':
-        'I\'m doing great, thank you for asking! I\'m here and ready to help you with anything you need.',
-    'what can you do':
-        'I can answer questions, help with writing, explain concepts, analyze text, and much more. I also have a voice feature — you can tap the speaker icon to hear any of my messages read aloud!',
-    'voice message':
-        'I received your voice message! While I am currently just a demo frontend and cannot process audio to text natively, I will pretend I heard you clearly. 🎤',
-    'voice':
-        'Yes! I have a built-in voice feature powered by your browser\'s speech synthesis. Just tap the speaker button on any of my messages to hear it. You can pause, resume, and stop playback anytime.',
-    'help':
-        'Of course! I\'m here to help. You can ask me anything — questions, explanations, creative writing, analysis, or just a friendly chat. Use the voice button to hear my responses aloud!',
-    'bye':
-        'Goodbye! It was great chatting with you. Feel free to come back anytime. Take care! 👋',
-    'thanks':
-        'You\'re very welcome! Happy to help. Is there anything else you\'d like to know?',
-    'thank you':
-        'You\'re absolutely welcome! Don\'t hesitate to ask if you need anything else.',
-    'weather':
-        'I don\'t have access to real-time weather data, but I\'d recommend checking a weather service like Weather.com or your phone\'s built-in weather app for accurate forecasts!',
-    'flutter':
-        'Flutter is Google\'s UI toolkit for building natively compiled applications for mobile, web, and desktop from a single codebase. It uses the Dart programming language and is known for its fast performance and expressive UI. This chatbot is built with Flutter!',
-    'just_audio':
-        'just_audio is a feature-rich Flutter audio package that supports playback from URLs, assets, files, and more. It works across iOS, Android, Web, and desktop. This chatbot uses it to play audio from URLs with full playback controls.',
-  };
-
-  /// Simulate an AI response with a short delay.
-  Future<ChatMessage> sendMessage(String userText) async {
-    // Simulate network/processing delay
-    final delay = 800 + _random.nextInt(700);
-    await Future.delayed(Duration(milliseconds: delay));
-
-    final response = _generateResponse(userText.toLowerCase().trim());
-
-    return ChatMessage(
-      text: response,
-      role: MessageRole.assistant,
-      // No pre-recorded audio URL; TTS is used instead via browser Speech API
-      // If you have a TTS backend, set audioUrl here, e.g.:
-      // audioUrl: 'https://your-tts-api.com/synthesize?text=${Uri.encodeComponent(response)}',
+  // ── Fetch blob URL bytes (works on Flutter Web) ────────────────────────────────
+  Future<List<int>> _fetchBlobBytes(String blobUrl) async {
+    final response = await Dio().get<List<int>>(
+      blobUrl,
+      options: Options(responseType: ResponseType.bytes),
     );
+    final bytes = response.data;
+    if (bytes == null || bytes.isEmpty) {
+      throw Exception('Recorded audio is empty.');
+    }
+    return bytes;
   }
 
-  String _generateResponse(String input) {
-    // Exact match first
-    if (_responses.containsKey(input)) {
-      return _responses[input]!;
-    }
+  /// Sends a user text or voice message to the API.
+  Future<ChatMessage> sendMessage(String userText, {String? audioUrl}) async {
+    String responseText;
 
-    // Partial keyword matching
-    for (final entry in _responses.entries) {
-      if (input.contains(entry.key)) {
-        return entry.value;
+    try {
+      final dio = Dio();
+      Response response;
+
+      if (audioUrl != null && audioUrl.isNotEmpty) {
+        // ── Voice message path ──────────────────────────────────────────────────
+        // On Flutter Web, the `record` package returns a blob:// URL.
+        // We read the bytes directly via the browser's native Fetch API.
+        final audioBytes = await _fetchBlobBytes(audioUrl);
+
+        // Detect format from URL; default to webm (opus) which browsers produce.
+        String filename = 'voice_note.webm';
+        if (audioUrl.contains('.wav')) {
+          filename = 'voice_note.wav';
+        } else if (audioUrl.contains('.mp3')) {
+          filename = 'voice_note.mp3';
+        } else if (audioUrl.contains('.m4a') || audioUrl.contains('aac')) {
+          filename = 'voice_note.m4a';
+        }
+
+        final formData = FormData.fromMap({
+          // The API expects a single file field named "file".
+          'file': MultipartFile.fromBytes(audioBytes, filename: filename),
+          'execute': true,
+          'max_rows': 100,
+        });
+
+        response = await dio.post(
+          'https://ai.erpultimate.com:8000/api/query/voice',
+          options: Options(
+            headers: {'Accept': 'application/json'},
+            contentType: 'multipart/form-data',
+          ),
+          data: formData,
+        );
+      } else {
+        // ── Text message path ───────────────────────────────────────────────────
+        response = await dio.post(
+          'https://ai.erpultimate.com:8000/api/query',
+          options: Options(headers: {'Content-Type': 'application/json'}),
+          data: json.encode({
+            'question': userText,
+            'execute': true,
+            'max_rows': 100,
+          }),
+        );
       }
+
+      // ── Parse response ────────────────────────────────────────────────────────
+      final responseData = response.data;
+      if (responseData is Map) {
+        final buffer = StringBuffer();
+
+        // 1. Data table rows (if any)
+        final data = responseData['data'];
+        if (data is List && data.isNotEmpty) {
+          // Build a simple readable table from the list of row-maps
+          final rows = data.cast<Map>();
+          final columns = rows.first.keys.toList();
+
+          // Header
+          buffer.writeln('📊 **Results:**');
+          for (final row in rows) {
+            for (final col in columns) {
+              final value = row[col];
+              // Format numbers nicely
+              String formatted;
+              if (value is num) {
+                formatted = value
+                    .toStringAsFixed(2)
+                    .replaceAllMapped(
+                      RegExp(r'\B(?=(\d{3})+(?!\d))'),
+                      (_) => ',',
+                    );
+              } else {
+                formatted = value?.toString() ?? '-';
+              }
+              buffer.writeln('• $col: $formatted');
+            }
+          }
+          buffer.writeln();
+        }
+
+        // 2. AI insight
+        final insight = responseData['ai_insight'];
+        if (insight != null && insight.toString().trim().isNotEmpty) {
+          buffer.writeln('💡 $insight');
+        }
+
+        responseText = buffer.toString().trim().isNotEmpty
+            ? buffer.toString().trim()
+            : 'No data returned.';
+      } else {
+        responseText = responseData.toString();
+      }
+    } catch (e) {
+      responseText = '⚠️ Error: $e';
     }
 
-    // Greeting fallback
-    if (input.isEmpty) {
-      return _greetings[_random.nextInt(_greetings.length)];
-    }
-
-    // Generic thoughtful responses
-    final generic = [
-      'That\'s an interesting question! While I\'m a demo assistant with limited knowledge, I\'d be happy to discuss this further. Could you provide more context?',
-      'Great point! In a full implementation, I\'d be connected to a powerful language model to give you a detailed answer. For now, I\'m demonstrating the voice and UI features of this chatbot.',
-      'I appreciate your message. This is a Flutter web chatbot demo showcasing real-time chat UI with voice playback using just_audio and browser Speech Synthesis. Ask me about Flutter, voice features, or just say hi!',
-      'Interesting! This chatbot is built with Flutter and uses just_audio for audio playback. Try tapping the 🔊 speaker button on any of my messages to hear it read aloud!',
-      'I\'m a demo AI assistant running in your browser. My voice feature uses the Web Speech API for text-to-speech, and just_audio for audio URL playback. What else would you like to explore?',
-    ];
-
-    return generic[_random.nextInt(generic.length)];
+    return ChatMessage(text: responseText, role: MessageRole.assistant);
   }
 
-  String getGreeting() {
-    return _greetings[_random.nextInt(_greetings.length)];
-  }
+  String getGreeting() => _greetings[_random.nextInt(_greetings.length)];
 }
